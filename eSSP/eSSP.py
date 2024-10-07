@@ -1,7 +1,8 @@
 # !/usr/bin/env python3
 import threading
-from ctypes import *
+import queue
 from time import sleep
+from ctypes import c_ulonglong, byref
 
 from six.moves import queue
 
@@ -35,6 +36,11 @@ class SspPollData6(Structure):
                 ("event_count", c_ubyte)]
 
 
+import threading
+import queue
+from time import sleep
+from ctypes import c_ulonglong, byref
+
 class eSSP(object):
     """Encrypted Smiley Secure Protocol Class"""
 
@@ -47,10 +53,10 @@ class eSSP(object):
         self.events = []
         # There can't be 9999 notes in the storage
         self.response_data['getnoteamount_response'] = 9999
-        self.sspC = self.essp.ssp_init(
-            com_port.encode(), ssp_address.encode(), debug)
+        self.sspC = self.essp.ssp_init(com_port.encode(), ssp_address.encode(), debug)
         self.poll = SspPollData6()
         setup_req = Ssp6SetupRequestData()
+
         # Check if the validator is present
         if self.essp.ssp6_sync(self.sspC) != Status.SSP_RESPONSE_OK.value:
             self.print_debug("NO VALIDATOR FOUND")
@@ -58,24 +64,22 @@ class eSSP(object):
             raise Exception("No validator found")
         else:
             self.print_debug("Validator Found !")
+
         # Try to setup encryption
-        if self.essp.ssp6_setup_encryption(self.sspC, c_ulonglong(
-                0x123456701234567)) == Status.SSP_RESPONSE_OK.value:
+        if self.essp.ssp6_setup_encryption(self.sspC, c_ulonglong(0x123456701234567)) == Status.SSP_RESPONSE_OK.value:
             self.print_debug("Encryption Setup")
         else:
             self.print_debug("Encryption Failed")
 
         # Checking the version, make sure we are using ssp version 6
-        if self.essp.ssp6_host_protocol(
-                self.sspC, 0x06) != Status.SSP_RESPONSE_OK.value:
+        if self.essp.ssp6_host_protocol(self.sspC, 0x06) != Status.SSP_RESPONSE_OK.value:
             self.print_debug(self.essp.ssp6_host_protocol(self.sspC, 0x06))
             self.print_debug("Host Protocol Failed")
             self.close()
             raise Exception("Host Protocol Failed")
 
         # Get some information about the validator
-        if self.essp.ssp6_setup_request(self.sspC, byref(
-                setup_req)) != Status.SSP_RESPONSE_OK.value:
+        if self.essp.ssp6_setup_request(self.sspC, byref(setup_req)) != Status.SSP_RESPONSE_OK.value:
             self.print_debug("Setup Request Failed")
             self.close()
             raise Exception("Setup request failed")
@@ -83,8 +87,7 @@ class eSSP(object):
         self.print_debug("Firmware %s " % (setup_req.FirmwareVersion.decode('utf8')))
         self.print_debug("Channels : ")
         for i, channel in enumerate(setup_req.ChannelData):
-            self.print_debug("Channel %s :  %s %s" %
-                  (str(i + 1), str(channel.value), channel.cc.decode()))
+            self.print_debug("Channel %s :  %s %s" % (str(i + 1), str(channel.value), channel.cc.decode()))
 
         # Enable the validator
         if self.essp.ssp6_enable(self.sspC) != Status.SSP_RESPONSE_OK.value:
@@ -94,30 +97,101 @@ class eSSP(object):
 
         if setup_req.UnitType == 0x03:  # magic number
             for channel in enumerate(setup_req.ChannelData):
-                self.essp.ssp6_set_coinmech_inhibits(
-                    self.sspC, channel.value, channel.cc, Status.ENABLED.value)
+                self.essp.ssp6_set_coinmech_inhibits(self.sspC, channel.value, channel.cc, Status.ENABLED.value)
         else:
             if setup_req.UnitType in {0x06, 0x07}:
                 # Enable the payout unit
-                if self.essp.ssp6_enable_payout(
-                        self.sspC, setup_req.UnitType) != Status.SSP_RESPONSE_OK.value:
+                if self.essp.ssp6_enable_payout(self.sspC, setup_req.UnitType) != Status.SSP_RESPONSE_OK.value:
                     self.print_debug("Payout Enable Failed")
 
             # Set the inhibits ( enable all note acceptance )
-            if self.essp.ssp6_set_inhibits(
-                    self.sspC, 0xFF, 0xFF) != Status.SSP_RESPONSE_OK.value:
+            if self.essp.ssp6_set_inhibits(self.sspC, 0xFF, 0xFF) != Status.SSP_RESPONSE_OK.value:
                 self.print_debug("Inhibits Failed")
                 self.close()
                 raise Exception("Inhibits failed")
 
+        # Ajout d'événements pour gérer les timeouts et arrêter le système proprement
+        self.action_timeout_event = threading.Event()
+        self.stop_event = threading.Event()
+        
+        # Timeout configuration (en secondes)
+        self.action_timeout_seconds = 10
+
+        # Thread système principal
         system_loop_thread = threading.Thread(target=self.system_loop)
         system_loop_thread.setDaemon(True)
         system_loop_thread.start()
 
+    def system_loop(self):
+        """Boucle principale du système."""
+        while not self.stop_event.is_set():
+            # Ajoute ton code de gestion de polling ici si besoin
+            sleep(1)  # Simule une boucle système régulière
+
+    def _action_loop(self):
+        """Loop to handle actions queued in the system."""
+        while not self.stop_event.is_set():
+            try:
+                self.do_actions_with_timeout(self.action_timeout_seconds)
+            except TimeoutError:
+                self.print_debug("Action timeout: l'action a pris trop de temps !")
+            sleep(0.5)
+
+    def do_actions_with_timeout(self, timeout):
+        """Process the queue of actions with timeout management."""
+        if not self.actions.empty():
+            # Définir l'événement de timeout avant d'exécuter l'action
+            self.action_timeout_event.clear()
+
+            # Démarrer un thread pour l'action avec un timeout
+            action_thread = threading.Thread(target=self.do_actions)
+            action_thread.start()
+
+            # Attendre que l'action se termine ou qu'elle dépasse le timeout
+            action_thread.join(timeout=timeout)
+
+            if action_thread.is_alive():
+                # Si l'action prend trop de temps, lever une erreur de timeout
+                self.action_timeout_event.set()
+                raise TimeoutError("L'action a dépassé le temps imparti !")
+
+            # Sinon, continuer normalement
+            self.print_debug("Action exécutée avec succès.")
+
+    def do_actions(self):
+        """Process the queue of actions."""
+        while not self.actions.empty() and not self.action_timeout_event.is_set():
+            action = self.actions.get()  # get and delete
+            self.print_debug(f"Processing action: {action}")
+            # Exécuter l'action correspondante en fonction du type d'action
+            if action == Actions.ROUTE_TO_CASHBOX:
+                self._route_cashbox_action()
+
+            elif action == Actions.ROUTE_TO_STORAGE:
+                self._route_storage_action()
+
+            elif action == Actions.PAYOUT:
+                self._payout_action()
+
+            # Gérer d'autres actions en fonction de ta logique...
+            
+            # Après traitement, marquer la tâche comme terminée
+            self.actions.task_done()
+        
+        # Vérifier si l'événement de timeout est déclenché
+        if self.action_timeout_event.is_set():
+            self.print_debug("Action annulée à cause du timeout.")
+    
+    def print_debug(self, message):
+        """Print debug messages if debug mode is enabled."""
+        if self.debug:
+            print(message)
+
     def close(self):
-        """Close the connection"""
-        self.reject()
-        self.essp.close_ssp_port()
+        """Stop all threads and clean up resources."""
+        self.stop_event.set()
+        self.print_debug("Stopping all threads and cleaning up.")
+
 
     def reject(self):
         """Reject the bill if there is one"""
